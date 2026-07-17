@@ -43,4 +43,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.uv.sources]
-openarm-control = { git = "https://github.com/enactic/openarm_control" }
+openarm-control = { path = "../openarm_control", editable = true }

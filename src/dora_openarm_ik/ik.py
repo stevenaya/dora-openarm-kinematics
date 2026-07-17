@@ -48,12 +48,20 @@ from openarm_control import (
 )
 
 
+def _map_range(x: float, in_min: float, in_max: float, out_min: float, out_max: float) -> float:
+    """Map a value from one range to another, with clipping."""
+    if in_max == in_min:
+        return out_min
+    x = max(min(x, in_max), in_min) if in_min < in_max else max(min(x, in_min), in_max)
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+
 def _map_trigger_to_gripper(trigger: float, side: str) -> float:
-    """trigger 0.0~1.0 → gripper angle"""
+    """trigger 0.0~1.0 → gripper angle (radians)"""
     if side == "right":
-        return (-1.57 / 2.0) * (1.0 - trigger)  # 0→-1.57, 1→0
+        return np.deg2rad(_map_range(trigger, 0.0, 1.0, -45.0, 8.0))
     else:
-        return (1.57 / 2.0) * (1.0 - trigger)   # 0→ 1.57, 1→0
+        return np.deg2rad(_map_range(trigger, 0.0, 1.0, 45.0, -8.0))
 
 
 def _run(args: argparse.Namespace) -> None:
@@ -62,15 +70,31 @@ def _run(args: argparse.Namespace) -> None:
     node = dora.Node()
     node.send_output("status", pa.array(["ready"]))
 
+    sync_enabled = True
+
     for event in node:
         if event["type"] != "INPUT":
             continue
 
         eid = event["id"]
+        if eid == "command":
+            command = event["value"][0].as_py()
+            if command in ("start", "intervene"):
+                kin.reset_posture_target()
+                sync_enabled = True
+            elif command in ("stop", "cancel", "success", "fail", "quit"):
+                sync_enabled = True
+            continue
+
+        if eid == "active":
+            active = bool(event["value"][0].as_py())
+            sync_enabled = not active
+            continue
+
         values = np.array(event["value"], dtype=np.float32)
 
         if eid == "position":
-            if values.shape == (16,):
+            if sync_enabled and values.shape == (16,):
                 kin.sync(values)
             continue
 
@@ -107,6 +131,7 @@ def _run(args: argparse.Namespace) -> None:
         ts = {"timestamp": time.time_ns()}
         node.send_output("position_right", pa.array(result[:8],  type=pa.float32()), ts)
         node.send_output("position_left",  pa.array(result[8:16], type=pa.float32()), ts)
+        sync_enabled = False
 
 
 def main() -> None:
