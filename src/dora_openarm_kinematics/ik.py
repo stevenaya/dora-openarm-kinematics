@@ -24,6 +24,8 @@ Inputs:
   target_left  – [{"pose": float32[8]}]  left  EE target pose + gripper angle
   position     – [{"qpos": float32[16]}] current joint state right[8]+left[8]
                  (optional sync)
+  active       – bool[1]  true while intervention drives the arm
+  command      – string[1]  episode/intervention lifecycle command
   Flat float32 arrays are also accepted for all inputs.
 
 Outputs:
@@ -70,6 +72,8 @@ def _run(args: argparse.Namespace) -> None:
 
     node = dora.Node()
     node.send_output("status", pa.array(["ready"]))
+    sync_enabled = True
+    intervention_armed = False
 
     for event in node:
         if event["type"] != "INPUT":
@@ -77,9 +81,23 @@ def _run(args: argparse.Namespace) -> None:
 
         eid = event["id"]
 
+        if eid == "command":
+            command = event["value"][0].as_py()
+            if command == "intervene":
+                intervention_armed = True
+            elif command in {"start", "stop", "cancel", "success", "fail", "quit"}:
+                intervention_armed = False
+            sync_enabled = True
+            continue
+
+        if eid == "active":
+            if intervention_armed:
+                sync_enabled = not bool(event["value"][0].as_py())
+            continue
+
         if eid == "position":
             values = extract_values(event["value"], "qpos")
-            if values.shape == (16,):
+            if sync_enabled and values.shape == (16,):
                 kin.sync(values)
             continue
 
@@ -120,6 +138,7 @@ def _run(args: argparse.Namespace) -> None:
         ts = {"timestamp": time.time_ns()}
         node.send_output("position_right", build_qpos_output(result[:8]), ts)
         node.send_output("position_left", build_qpos_output(result[8:16]), ts)
+        sync_enabled = False
 
 
 def main() -> None:
