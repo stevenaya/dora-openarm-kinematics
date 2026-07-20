@@ -22,8 +22,9 @@ Pose convention:  float32[8] = [px, py, pz, qw, qx, qy, qz, gripper_angle]
 Inputs:
   target_right – [{"pose": float32[8]}]  right EE target pose + gripper angle
   target_left  – [{"pose": float32[8]}]  left  EE target pose + gripper angle
-  position     – [{"qpos": float32[16]}] current joint state right[8]+left[8]
-                 (optional sync)
+  position_right – [{"qpos": float32[8]}] current right joint state
+  position_left  – [{"qpos": float32[8]}] current left joint state
+                   (paired internally for optional sync)
   active       – bool[1]  true while intervention drives the arm
   command      – string[1]  episode/intervention lifecycle command
   Flat float32 arrays are also accepted for all inputs.
@@ -67,6 +68,39 @@ def extract_values(value: pa.Array, key: str) -> np.ndarray:
     return np.array(value, dtype=np.float32)
 
 
+def _sync_before_solve(
+    kin: Kinematics,
+    measured_qpos: np.ndarray | None,
+    enabled: bool,
+) -> None:
+    if enabled and measured_qpos is not None:
+        kin.sync(measured_qpos)
+
+
+class _BimanualPositionBuffer:
+    """Emit right+left qpos after receiving a fresh sample from each arm."""
+
+    def __init__(self) -> None:
+        self._positions: dict[str, np.ndarray] = {}
+        self._updated: set[str] = set()
+
+    def update(self, side: str, qpos: np.ndarray) -> np.ndarray | None:
+        if side not in {"right", "left"}:
+            raise ValueError(f"Unknown arm side: {side}")
+        if qpos.shape != (8,):
+            raise ValueError(f"Per-arm qpos must contain 8 values, got {qpos.shape}")
+
+        self._positions[side] = qpos.copy()
+        self._updated.add(side)
+        if self._updated != {"right", "left"}:
+            return None
+
+        self._updated.clear()
+        return np.concatenate(
+            [self._positions["right"], self._positions["left"]]
+        ).astype(np.float32)
+
+
 def _run(args: argparse.Namespace) -> None:
     kin = Kinematics(setup_from_args(args), ik_params_from_args(args))
 
@@ -74,6 +108,8 @@ def _run(args: argparse.Namespace) -> None:
     node.send_output("status", pa.array(["ready"]))
     sync_enabled = True
     intervention_armed = False
+    measured_qpos: np.ndarray | None = None
+    position_buffer = _BimanualPositionBuffer()
 
     for event in node:
         if event["type"] != "INPUT":
@@ -95,10 +131,17 @@ def _run(args: argparse.Namespace) -> None:
                 sync_enabled = not bool(event["value"][0].as_py())
             continue
 
-        if eid == "position":
+        if eid in {"position_right", "position_left"}:
             values = extract_values(event["value"], "qpos")
-            if sync_enabled and values.shape == (16,):
-                kin.sync(values)
+            if values.shape != (8,):
+                print(f"Warning: expected {eid}[8], got {values.shape}. Skipping.")
+                continue
+            side = eid.removeprefix("position_")
+            paired_qpos = position_buffer.update(side, values)
+            if paired_qpos is not None:
+                measured_qpos = paired_qpos
+                if sync_enabled:
+                    kin.sync(paired_qpos)
             continue
 
         if eid == "target_right" and "right" in kin.setup.sides:
@@ -131,6 +174,7 @@ def _run(args: argparse.Namespace) -> None:
         if not kin.ready():
             continue
 
+        _sync_before_solve(kin, measured_qpos, args.sync_during_active)
         result = kin.solve()
         if result is None:
             continue
@@ -141,15 +185,23 @@ def _run(args: argparse.Namespace) -> None:
         sync_enabled = False
 
 
-def main() -> None:
-    """Inverse kinematics for OpenArm."""
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Mink IK dora node – OpenArm end-effector pose → joint angles"
     )
     register_common_args(parser)
     register_ik_args(parser)
-    args = parser.parse_args()
-    _run(args)
+    parser.add_argument(
+        "--sync-during-active",
+        action="store_true",
+        help="Sync the latest measured arm qpos once before each active IK solve.",
+    )
+    return parser
+
+
+def main() -> None:
+    """Inverse kinematics for OpenArm."""
+    _run(_build_parser().parse_args())
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ Solves joint angles from EE pose targets using mink's QP-based differential IK. 
 
 | | |
 |---|---|
-| **Inputs** | `target_right`, `target_left` `[{"pose": float32[7]}]` — EE pose targets; `position` `[{"qpos": float32[16]}]` — optional joint-state sync (flat arrays also accepted); `trigger_right` / `trigger_left` `float32[1]` — gripper pass-through |
+| **Inputs** | `target_right`, `target_left` `[{"pose": float32[8]}]` — EE pose targets + gripper; `position_right`, `position_left` `[{"qpos": float32[8]}]` — optional joint-state sync, paired internally (flat arrays also accepted) |
 | **Outputs** | `position_right`, `position_left` `[{"qpos": float32[8]}]` |
 
 ```
