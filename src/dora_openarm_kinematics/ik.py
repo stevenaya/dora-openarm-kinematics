@@ -25,6 +25,9 @@ Inputs:
   position_right – [{"qpos": float32[8]}] current right joint state
   position_left  – [{"qpos": float32[8]}] current left joint state
                    (paired internally for optional sync)
+  state_right – [{"qpos": float32[8], "qvel": float32[8]}] right arm state
+  state_left  – [{"qpos": float32[8], "qvel": float32[8]}] left arm state
+                (used only when state feedback blending is enabled)
   active       – bool[1]  true while intervention drives the arm
   command      – string[1]  episode/intervention lifecycle command
   Flat float32 arrays are also accepted for all inputs.
@@ -38,6 +41,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import time
 
 import dora
@@ -77,6 +81,30 @@ def _sync_before_solve(
         kin.sync(measured_qpos)
 
 
+@dataclass(frozen=True)
+class _MeasuredState:
+    qpos: np.ndarray
+    qvel: np.ndarray
+    received_at: float
+
+
+def _apply_state_feedback(
+    kin: Kinematics,
+    state: _MeasuredState | None,
+    blend: float,
+    max_prediction_dt: float,
+    now: float | None = None,
+) -> bool:
+    """Apply one fresh measured state and return whether it was consumed."""
+    if state is None or blend <= 0.0:
+        return False
+    if now is None:
+        now = time.monotonic()
+    prediction_dt = min(max(now - state.received_at, 0.0), max_prediction_dt)
+    kin.blend_state(state.qpos, state.qvel, blend, prediction_dt)
+    return True
+
+
 class _BimanualPositionBuffer:
     """Emit right+left qpos after receiving a fresh sample from each arm."""
 
@@ -101,7 +129,57 @@ class _BimanualPositionBuffer:
         ).astype(np.float32)
 
 
+class _BimanualStateBuffer:
+    """Emit one fresh paired qpos/qvel sample from the two arm drivers."""
+
+    def __init__(self) -> None:
+        self._states: dict[str, tuple[np.ndarray, np.ndarray, float]] = {}
+        self._updated: set[str] = set()
+
+    def reset(self) -> None:
+        """Discard cached samples so a new pair cannot include stale state."""
+        self._states.clear()
+        self._updated.clear()
+
+    def update(
+        self,
+        side: str,
+        qpos: np.ndarray,
+        qvel: np.ndarray,
+        received_at: float,
+    ) -> _MeasuredState | None:
+        if side not in {"right", "left"}:
+            raise ValueError(f"Unknown arm side: {side}")
+        if qpos.shape != (8,) or qvel.shape != (8,):
+            raise ValueError(
+                "Per-arm state qpos and qvel must each contain 8 values."
+            )
+
+        self._states[side] = (qpos.copy(), qvel.copy(), received_at)
+        self._updated.add(side)
+        if self._updated != {"right", "left"}:
+            return None
+
+        self._updated.clear()
+        right_qpos, right_qvel, right_time = self._states["right"]
+        left_qpos, left_qvel, left_time = self._states["left"]
+        return _MeasuredState(
+            qpos=np.concatenate([right_qpos, left_qpos]).astype(np.float32),
+            qvel=np.concatenate([right_qvel, left_qvel]).astype(np.float32),
+            received_at=max(right_time, left_time),
+        )
+
+
 def _run(args: argparse.Namespace) -> None:
+    if not 0.0 <= args.state_feedback_blend <= 1.0:
+        raise ValueError("--state-feedback-blend must be between 0 and 1.")
+    if args.state_feedback_max_prediction_dt < 0.0:
+        raise ValueError("--state-feedback-max-prediction-dt must be non-negative.")
+    if args.sync_during_active and args.state_feedback_blend > 0.0:
+        raise ValueError(
+            "--sync-during-active and --state-feedback-blend cannot be enabled together."
+        )
+
     kin = Kinematics(setup_from_args(args), ik_params_from_args(args))
 
     node = dora.Node()
@@ -110,6 +188,8 @@ def _run(args: argparse.Namespace) -> None:
     intervention_armed = False
     measured_qpos: np.ndarray | None = None
     position_buffer = _BimanualPositionBuffer()
+    state_buffer = _BimanualStateBuffer()
+    pending_feedback: _MeasuredState | None = None
 
     for event in node:
         if event["type"] != "INPUT":
@@ -121,8 +201,11 @@ def _run(args: argparse.Namespace) -> None:
             command = event["value"][0].as_py()
             if command == "intervene":
                 intervention_armed = True
+                pending_feedback = None
             elif command in {"start", "stop", "cancel", "success", "fail", "quit"}:
                 intervention_armed = False
+                pending_feedback = None
+            state_buffer.reset()
             sync_enabled = True
             continue
 
@@ -142,6 +225,26 @@ def _run(args: argparse.Namespace) -> None:
                 measured_qpos = paired_qpos
                 if sync_enabled:
                     kin.sync(paired_qpos)
+            continue
+
+        if eid in {"state_right", "state_left"}:
+            qpos = extract_values(event["value"], "qpos")
+            qvel = extract_values(event["value"], "qvel")
+            if qpos.shape != (8,) or qvel.shape != (8,):
+                print(
+                    f"Warning: expected {eid} qpos[8]/qvel[8], got "
+                    f"{qpos.shape}/{qvel.shape}. Skipping."
+                )
+                continue
+            if not np.all(np.isfinite(qpos)) or not np.all(np.isfinite(qvel)):
+                print(f"Warning: non-finite values in {eid}. Skipping.")
+                continue
+            side = eid.removeprefix("state_")
+            paired_state = state_buffer.update(
+                side, qpos, qvel, received_at=time.monotonic()
+            )
+            if paired_state is not None:
+                pending_feedback = paired_state
             continue
 
         if eid == "target_right" and "right" in kin.setup.sides:
@@ -175,6 +278,13 @@ def _run(args: argparse.Namespace) -> None:
             continue
 
         _sync_before_solve(kin, measured_qpos, args.sync_during_active)
+        if _apply_state_feedback(
+            kin,
+            pending_feedback,
+            args.state_feedback_blend,
+            args.state_feedback_max_prediction_dt,
+        ):
+            pending_feedback = None
         result = kin.solve()
         if result is None:
             continue
@@ -195,6 +305,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sync-during-active",
         action="store_true",
         help="Sync the latest measured arm qpos once before each active IK solve.",
+    )
+    parser.add_argument(
+        "--state-feedback-blend",
+        type=float,
+        default=0.0,
+        help=(
+            "Measured-state weight applied once per fresh paired state; "
+            "0 keeps pure feedforward and 1 uses the predicted measured state."
+        ),
+    )
+    parser.add_argument(
+        "--state-feedback-max-prediction-dt",
+        type=float,
+        default=0.004,
+        help="Maximum qvel extrapolation horizon in seconds (default: 0.004).",
     )
     return parser
 

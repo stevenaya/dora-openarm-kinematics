@@ -22,6 +22,9 @@ if "pyarrow" not in sys.modules:
 
 from dora_openarm_kinematics.ik import (
     _BimanualPositionBuffer,
+    _BimanualStateBuffer,
+    _MeasuredState,
+    _apply_state_feedback,
     _build_parser,
     _sync_before_solve,
 )
@@ -30,9 +33,21 @@ from dora_openarm_kinematics.ik import (
 class _FakeKinematics:
     def __init__(self) -> None:
         self.synced: list[np.ndarray] = []
+        self.blended: list[tuple[np.ndarray, np.ndarray, float, float]] = []
 
     def sync(self, values: np.ndarray) -> None:
         self.synced.append(values.copy())
+
+    def blend_state(
+        self,
+        qpos: np.ndarray,
+        qvel: np.ndarray,
+        blend: float,
+        prediction_dt: float,
+    ) -> None:
+        self.blended.append(
+            (qpos.copy(), qvel.copy(), blend, prediction_dt)
+        )
 
 
 class MeasuredSyncTest(unittest.TestCase):
@@ -41,7 +56,10 @@ class MeasuredSyncTest(unittest.TestCase):
     def test_flag_is_disabled_by_default(self) -> None:
         """The command-line switch is opt-in."""
         parser = _build_parser()
-        self.assertFalse(parser.parse_args([]).sync_during_active)
+        defaults = parser.parse_args([])
+        self.assertFalse(defaults.sync_during_active)
+        self.assertEqual(defaults.state_feedback_blend, 0.0)
+        self.assertEqual(defaults.state_feedback_max_prediction_dt, 0.004)
         self.assertTrue(parser.parse_args(["--sync-during-active"]).sync_during_active)
 
     def test_disabled_sync_preserves_current_behavior(self) -> None:
@@ -102,6 +120,79 @@ class BimanualPositionBufferTest(unittest.TestCase):
         buffer = _BimanualPositionBuffer()
         with self.assertRaisesRegex(ValueError, "8 values"):
             buffer.update("right", np.arange(7, dtype=np.float32))
+
+
+class MeasuredStateFeedbackTest(unittest.TestCase):
+    """Verify fresh q/dq pairing and bounded state prediction."""
+
+    def test_state_buffer_pairs_position_velocity_and_latest_time(self) -> None:
+        """A pair preserves each field and uses the newer receive time."""
+        buffer = _BimanualStateBuffer()
+        right_qpos = np.arange(8, dtype=np.float32)
+        right_qvel = np.arange(10, 18, dtype=np.float32)
+        left_qpos = np.arange(20, 28, dtype=np.float32)
+        left_qvel = np.arange(30, 38, dtype=np.float32)
+
+        self.assertIsNone(
+            buffer.update("right", right_qpos, right_qvel, received_at=10.0)
+        )
+        paired = buffer.update(
+            "left", left_qpos, left_qvel, received_at=10.002
+        )
+
+        assert paired is not None
+        np.testing.assert_array_equal(
+            paired.qpos, np.concatenate([right_qpos, left_qpos])
+        )
+        np.testing.assert_array_equal(
+            paired.qvel, np.concatenate([right_qvel, left_qvel])
+        )
+        self.assertEqual(paired.received_at, 10.002)
+
+    def test_feedback_blends_once_with_capped_prediction_age(self) -> None:
+        """Feedback caps qvel extrapolation at the configured horizon."""
+        kin = _FakeKinematics()
+        state = _MeasuredState(
+            qpos=np.arange(16, dtype=np.float32),
+            qvel=np.arange(20, 36, dtype=np.float32),
+            received_at=10.0,
+        )
+
+        consumed = _apply_state_feedback(
+            kin,
+            state,
+            blend=0.5,
+            max_prediction_dt=0.004,
+            now=10.02,
+        )
+
+        self.assertTrue(consumed)
+        self.assertEqual(len(kin.blended), 1)
+        qpos, qvel, blend, prediction_dt = kin.blended[0]
+        np.testing.assert_array_equal(qpos, state.qpos)
+        np.testing.assert_array_equal(qvel, state.qvel)
+        self.assertEqual(blend, 0.5)
+        self.assertEqual(prediction_dt, 0.004)
+
+    def test_disabled_feedback_is_exact_feedforward_noop(self) -> None:
+        """A zero blend leaves the feedforward path untouched."""
+        kin = _FakeKinematics()
+        state = _MeasuredState(
+            qpos=np.zeros(16, dtype=np.float32),
+            qvel=np.zeros(16, dtype=np.float32),
+            received_at=10.0,
+        )
+
+        consumed = _apply_state_feedback(
+            kin,
+            state,
+            blend=0.0,
+            max_prediction_dt=0.004,
+            now=10.001,
+        )
+
+        self.assertFalse(consumed)
+        self.assertEqual(kin.blended, [])
 
 
 if __name__ == "__main__":
