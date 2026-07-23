@@ -25,9 +25,13 @@ Inputs:
   position_right – [{"qpos": float32[8]}] current right joint state
   position_left  – [{"qpos": float32[8]}] current left joint state
                    (paired internally for optional sync)
+  state_right – [{"qpos": float32[8], "qvel": float32[8], ...}]
+  state_left  – [{"qpos": float32[8], "qvel": float32[8], ...}]
+                measured state used by state-aware IK safety limits
   active       – bool[1]  true while intervention drives the arm
   command      – string[1]  episode/intervention lifecycle command
-  Flat float32 arrays are also accepted for all inputs.
+  Flat float32 arrays are also accepted for target and position inputs. State
+  inputs use the normalized struct format so qpos and qvel remain distinct.
 
 Outputs:
   position_right – [{"qpos": float32[8]}] solved right arm joint angles
@@ -101,6 +105,42 @@ class _BimanualPositionBuffer:
         ).astype(np.float32)
 
 
+class _BimanualStateBuffer:
+    """Emit paired right+left qpos/qvel after a fresh state from each arm."""
+
+    def __init__(self) -> None:
+        self._states: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._updated: set[str] = set()
+
+    def update(
+        self,
+        side: str,
+        qpos: np.ndarray,
+        qvel: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        if side not in {"right", "left"}:
+            raise ValueError(f"Unknown arm side: {side}")
+        if qpos.shape != (8,) or qvel.shape != (8,):
+            raise ValueError(
+                "Per-arm state qpos and qvel must each contain 8 values, "
+                f"got {qpos.shape} and {qvel.shape}"
+            )
+
+        self._states[side] = (qpos.copy(), qvel.copy())
+        self._updated.add(side)
+        if self._updated != {"right", "left"}:
+            return None
+
+        self._updated.clear()
+        paired_qpos = np.concatenate(
+            [self._states["right"][0], self._states["left"][0]]
+        ).astype(np.float32)
+        paired_qvel = np.concatenate(
+            [self._states["right"][1], self._states["left"][1]]
+        ).astype(np.float32)
+        return paired_qpos, paired_qvel
+
+
 def _run(args: argparse.Namespace) -> None:
     kin = Kinematics(setup_from_args(args), ik_params_from_args(args))
 
@@ -110,6 +150,7 @@ def _run(args: argparse.Namespace) -> None:
     intervention_armed = False
     measured_qpos: np.ndarray | None = None
     position_buffer = _BimanualPositionBuffer()
+    state_buffer = _BimanualStateBuffer()
 
     for event in node:
         if event["type"] != "INPUT":
@@ -142,6 +183,27 @@ def _run(args: argparse.Namespace) -> None:
                 measured_qpos = paired_qpos
                 if sync_enabled:
                     kin.sync(paired_qpos)
+            continue
+
+        if eid in {"state_right", "state_left"}:
+            if not pa.types.is_struct(event["value"].type):
+                print(f"Warning: expected normalized struct for {eid}. Skipping.")
+                continue
+            qpos = extract_values(event["value"], "qpos")
+            qvel = extract_values(event["value"], "qvel")
+            if qpos.shape != (8,) or qvel.shape != (8,):
+                print(
+                    f"Warning: expected {eid} qpos[8]/qvel[8], "
+                    f"got {qpos.shape}/{qvel.shape}. Skipping."
+                )
+                continue
+            side = eid.removeprefix("state_")
+            paired_state = state_buffer.update(side, qpos, qvel)
+            if paired_state is not None:
+                kin.update_measured_state(
+                    *paired_state,
+                    timestamp=time.monotonic(),
+                )
             continue
 
         if eid == "target_right" and "right" in kin.setup.sides:

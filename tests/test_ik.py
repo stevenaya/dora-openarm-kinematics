@@ -22,6 +22,7 @@ if "pyarrow" not in sys.modules:
 
 from dora_openarm_kinematics.ik import (
     _BimanualPositionBuffer,
+    _BimanualStateBuffer,
     _build_parser,
     _sync_before_solve,
 )
@@ -102,6 +103,65 @@ class BimanualPositionBufferTest(unittest.TestCase):
         buffer = _BimanualPositionBuffer()
         with self.assertRaisesRegex(ValueError, "8 values"):
             buffer.update("right", np.arange(7, dtype=np.float32))
+
+
+class BimanualStateBufferTest(unittest.TestCase):
+    """Verify normalized driver states are paired for state-aware limits."""
+
+    def test_waits_for_both_sides_and_preserves_qpos_qvel_order(self) -> None:
+        """A state pair preserves canonical side order for both quantities."""
+        buffer = _BimanualStateBuffer()
+        right_qpos = np.arange(8, dtype=np.float32)
+        right_qvel = np.arange(20, 28, dtype=np.float32)
+        left_qpos = np.arange(10, 18, dtype=np.float32)
+        left_qvel = np.arange(30, 38, dtype=np.float32)
+
+        self.assertIsNone(buffer.update("right", right_qpos, right_qvel))
+        paired = buffer.update("left", left_qpos, left_qvel)
+
+        self.assertIsNotNone(paired)
+        assert paired is not None
+        qpos, qvel = paired
+        np.testing.assert_array_equal(
+            qpos,
+            np.concatenate([right_qpos, left_qpos]),
+        )
+        np.testing.assert_array_equal(
+            qvel,
+            np.concatenate([right_qvel, left_qvel]),
+        )
+
+    def test_requires_fresh_state_from_each_side(self) -> None:
+        """Each emitted pair consumes one fresh state from both arms."""
+        buffer = _BimanualStateBuffer()
+        values = np.arange(8, dtype=np.float32)
+
+        self.assertIsNone(buffer.update("right", values, values))
+        self.assertIsNotNone(buffer.update("left", values, values))
+        self.assertIsNone(buffer.update("left", values + 1, values + 2))
+        paired = buffer.update("right", values + 3, values + 4)
+
+        self.assertIsNotNone(paired)
+        assert paired is not None
+        qpos, qvel = paired
+        np.testing.assert_array_equal(
+            qpos,
+            np.concatenate([values + 3, values + 1]),
+        )
+        np.testing.assert_array_equal(
+            qvel,
+            np.concatenate([values + 4, values + 2]),
+        )
+
+    def test_rejects_invalid_state_shape(self) -> None:
+        """Per-arm qpos and qvel must both include all eight driver joints."""
+        buffer = _BimanualStateBuffer()
+        with self.assertRaisesRegex(ValueError, "each contain 8 values"):
+            buffer.update(
+                "right",
+                np.arange(8, dtype=np.float32),
+                np.arange(7, dtype=np.float32),
+            )
 
 
 if __name__ == "__main__":
