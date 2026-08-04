@@ -39,8 +39,16 @@ Solves joint angles from EE pose targets using mink's QP-based differential IK. 
 
 | | |
 |---|---|
-| **Inputs** | `target_right`, `target_left` `[{"pose": float32[7]}]` — EE pose targets; `position` `[{"qpos": float32[16]}]` — optional joint-state sync (flat arrays also accepted); `trigger_right` / `trigger_left` `float32[1]` — gripper pass-through |
+| **Inputs** | `target_right`, `target_left` `[{"pose": float32[8]}]` — EE pose plus gripper; `state_right`, `state_left` — normalized `qpos[8]` / `qvel[8]` state; `syncstate` `bool[1]` — measured-state synchronization; optional `active` `bool[1]` — output gate |
 | **Outputs** | `position_right`, `position_left` `[{"qpos": float32[8]}]` |
+
+`--target-mode absolute` preserves direct target handling. In `relative` mode,
+targets received during `syncstate=true` are captured as source references when
+synchronization is released, then their translation and rotation deltas are
+applied to end-effector poses computed from the same measured joint snapshot.
+The next complete active-arm target pair starts solving. If `active` is not
+connected, output is enabled for compatibility with existing dataflows. Source
+and absolute poses use the configured IK origin frame (normally `arm_origin`).
 
 ```
 --mode           right | left | bimanual  (default: bimanual)
@@ -51,6 +59,11 @@ Solves joint angles from EE pose targets using mink's QP-based differential IK. 
 --posture-cost   posture task weight, 0 = disabled  (default: 0.0)
 --pos-cost       position task cost  (default: 1.0)
 --ori-cost       orientation task cost  (default: 1.0)
+--target-mode    absolute | relative  (default: absolute)
+--measured-state-timeout
+                 measured-state lifetime  (default: 0.1 s)
+--relative-input-timeout
+                 source-pose lifetime when capturing references  (default: 0.1 s)
 --solver         QP backend  (default: daqp)
 --frame-right    site/body name for right EE  (default: right_ee_control_point)
 --frame-left     site/body name for left EE   (default: left_ee_control_point)
