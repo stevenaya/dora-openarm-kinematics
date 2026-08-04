@@ -49,6 +49,8 @@ applied to end-effector poses computed from the same measured joint snapshot.
 The next complete active-arm target pair starts solving. If `active` is not
 connected, output is enabled for compatibility with existing dataflows. Source
 and absolute poses use the configured IK origin frame (normally `arm_origin`).
+See [IK target modes runtime proposal](docs/ik-target-modes-proposal.md) for the
+complete state machine, coordinate convention, and integration sequence.
 
 ```
 --mode           right | left | bimanual  (default: bimanual)
