@@ -27,6 +27,9 @@ Converts per-arm joint angles to end-effector poses via `mj_forward`.
 --frame-right    MuJoCo site/body/geom name for right EE  (default: right_ee_control_point)
 --frame-left     MuJoCo site/body/geom name for left EE   (default: left_ee_control_point)
 --frame-type-*   body | site | geom  (default: site)
+--origin-frame   pose reference frame, or world  (default: arm_origin)
+--origin-frame-type
+                 body | site | geom  (default: site)
 --keyframe       initial keyframe name  (default: home)
 --xml            MJCF scene file
 ```
@@ -39,21 +42,43 @@ Solves joint angles from EE pose targets using mink's QP-based differential IK. 
 
 | | |
 |---|---|
-| **Inputs** | `target_right`, `target_left` `[{"pose": float32[7]}]` — EE pose targets; `position` `[{"qpos": float32[16]}]` — optional joint-state sync (flat arrays also accepted); `trigger_right` / `trigger_left` `float32[1]` — gripper pass-through |
+| **Inputs** | `target_right`, `target_left` `[{"pose": float32[8]}]` — EE pose target plus gripper; `state_right`, `state_left` normalized driver state structs with `qpos[8]` and `qvel[8]` (measured qpos drives limits and sync); `syncstate` `bool[1]` — enable measured-configuration synchronization |
 | **Outputs** | `position_right`, `position_left` `[{"qpos": float32[8]}]` |
+
+Complete, fresh active-arm states update state-aware limits. While `syncstate`
+is true they also synchronize the IK configuration; changing it to false
+performs one final fresh-state sync before targets resume. After
+`--measured-state-timeout`, limits fall back to command state. Single-arm modes
+require and publish only their active side. If `syncstate` is not connected,
+target-only dataflows keep their keyframe-based behavior.
+Targets are ignored while synchronization is active or waiting for fresh state.
+After either `syncstate` transition, every active side must provide a new target
+before the next solve, so targets from opposite sides of a clutch cannot mix.
+
+FK outputs and IK targets share `--origin-frame` (default: `arm_origin`).
+Endpoint and origin objects may be bodies, sites, or geoms. VR translation
+deltas use the `arm_origin` axes, so a rotated origin requires upstream
+conversion.
 
 ```
 --mode           right | left | bimanual  (default: bimanual)
 --max-iters      IK iterations per event  (default: 5)
---dt             integration timestep per iteration  (default: 0.5)
---damping        global Tikhonov regularization  (default: 1e-3)
---lm-damping     per-task LM damping  (default: 1e-4)
+--dt             outer control period  (default: 1 / --tick-hz)
+--tick-hz        nominal control rate  (default: 250)
+--damping        global Tikhonov regularization  (default: 0.1)
+--lm-damping     per-task LM damping  (default: 0.01)
 --posture-cost   posture task weight, 0 = disabled  (default: 0.0)
---pos-cost       position task cost  (default: 1.0)
---ori-cost       orientation task cost  (default: 1.0)
+--pos-cost       position task cost  (default: 12.0)
+--ori-cost       orientation task cost  (default: 1.5)
+--measured-state-timeout
+                 measured-state lifetime for safety limits  (default: 0.1 s)
 --solver         QP backend  (default: daqp)
---frame-right    site/body name for right EE  (default: right_ee_control_point)
---frame-left     site/body name for left EE   (default: left_ee_control_point)
+--frame-right    site/body/geom name for right EE  (default: right_ee_control_point)
+--frame-left     site/body/geom name for left EE   (default: left_ee_control_point)
+--frame-type-*   body | site | geom  (default: site)
+--origin-frame   pose reference frame, or world  (default: arm_origin)
+--origin-frame-type
+                 body | site | geom  (default: site)
 --keyframe       initial keyframe  (default: home)
 --xml            MJCF scene file
 ```

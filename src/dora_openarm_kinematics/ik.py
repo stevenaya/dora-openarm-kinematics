@@ -22,9 +22,10 @@ Pose convention:  float32[8] = [px, py, pz, qw, qx, qy, qz, gripper_angle]
 Inputs:
   target_right – [{"pose": float32[8]}]  right EE target pose + gripper angle
   target_left  – [{"pose": float32[8]}]  left  EE target pose + gripper angle
-  position     – [{"qpos": float32[16]}] current joint state right[8]+left[8]
-                 (optional sync)
-  Flat float32 arrays are also accepted for all inputs.
+  state_right/left – normalized state with qpos[8] and qvel[8]; measured qpos
+                     is used by state-aware limits and configuration sync
+  syncstate – bool[1], true while measured q should overwrite IK configuration
+  Flat float32 arrays are also accepted for target inputs.
 
 Outputs:
   position_right – [{"qpos": float32[8]}] solved right arm joint angles
@@ -65,22 +66,95 @@ def extract_values(value: pa.Array, key: str) -> np.ndarray:
     return np.array(value, dtype=np.float32)
 
 
+def _has_fresh_state(
+    received_at: dict[str, float],
+    sides: list[str],
+    now: float,
+    timeout: float,
+) -> bool:
+    return all(now - received_at.get(side, -np.inf) <= timeout for side in sides)
+
+
 def _run(args: argparse.Namespace) -> None:
+    if (
+        not np.isfinite(args.measured_state_timeout)
+        or args.measured_state_timeout <= 0.0
+    ):
+        raise ValueError("--measured-state-timeout must be finite and positive.")
+
     kin = Kinematics(setup_from_args(args), ik_params_from_args(args))
 
     node = dora.Node()
     node.send_output("status", pa.array(["ready"]))
+    state_qpos = np.hstack(
+        [
+            np.append(*kin.setup.joint_resolver.get_driver(kin.setup.data.qpos, side))
+            for side in ("right", "left")
+        ]
+    ).astype(np.float32)
+    state_received_at: dict[str, float] = {}
+    sync_enabled = False
+    sync_pending = False
+    pending_targets = set(kin.setup.sides)
+
+    def sync_from_cached_state(now: float) -> None:
+        nonlocal sync_pending
+        if not (sync_enabled or sync_pending) or not _has_fresh_state(
+            state_received_at,
+            kin.setup.sides,
+            now,
+            args.measured_state_timeout,
+        ):
+            return
+        kin.sync(state_qpos)
+        if sync_pending:
+            print("[ik] Synchronized configuration from measured state.", flush=True)
+        sync_pending = False
 
     for event in node:
         if event["type"] != "INPUT":
             continue
 
         eid = event["id"]
+        now = time.monotonic()
 
-        if eid == "position":
-            values = extract_values(event["value"], "qpos")
-            if values.shape == (16,):
-                kin.sync(values)
+        if eid == "syncstate":
+            value = event["value"]
+            if (
+                len(value) != 1
+                or not pa.types.is_boolean(value.type)
+                or not value[0].is_valid
+            ):
+                print("Warning: expected syncstate bool[1]. Skipping.")
+                continue
+            requested = bool(value[0].as_py())
+            if requested != sync_enabled:
+                sync_enabled = requested
+                sync_pending = True
+                pending_targets = set(kin.setup.sides)
+            sync_from_cached_state(now)
+            continue
+
+        if eid in {"state_right", "state_left"}:
+            if not pa.types.is_struct(event["value"].type):
+                print(f"Warning: expected normalized struct for {eid}. Skipping.")
+                continue
+            qpos = extract_values(event["value"], "qpos")
+            qvel = extract_values(event["value"], "qvel")
+            if qpos.shape != (8,) or qvel.shape != (8,):
+                print(
+                    f"Warning: expected {eid} qpos[8]/qvel[8], "
+                    f"got {qpos.shape}/{qvel.shape}. Skipping."
+                )
+                continue
+            side = eid.removeprefix("state_")
+            arm_slice = slice(0, 8) if side == "right" else slice(8, 16)
+            state_qpos[arm_slice] = qpos
+            state_received_at[side] = now
+            sync_from_cached_state(now)
+            continue
+
+        if eid in {"target_right", "target_left"} and (sync_enabled or sync_pending):
             continue
 
         if eid == "target_right" and "right" in kin.setup.sides:
@@ -94,6 +168,7 @@ def _run(args: argparse.Namespace) -> None:
             gripper_angle = values[7]
             kin.set_target("right", pose)
             kin.set_gripper("right", gripper_angle)
+            pending_targets.discard("right")
 
         elif eid == "target_left" and "left" in kin.setup.sides:
             values = extract_values(event["value"], "pose")
@@ -106,20 +181,35 @@ def _run(args: argparse.Namespace) -> None:
             gripper_angle = values[7]
             kin.set_target("left", pose)
             kin.set_gripper("left", gripper_angle)
+            pending_targets.discard("left")
 
         else:
             continue
 
+        if pending_targets:
+            continue
+        pending_targets = set(kin.setup.sides)
         if not kin.ready():
             continue
 
+        if _has_fresh_state(
+            state_received_at,
+            kin.setup.sides,
+            now,
+            args.measured_state_timeout,
+        ):
+            kin.update_measured_state(state_qpos)
+        elif state_received_at:
+            kin.clear_measured_state()
         result = kin.solve()
         if result is None:
             continue
 
         ts = {"timestamp": time.time_ns()}
-        node.send_output("position_right", build_qpos_output(result[:8]), ts)
-        node.send_output("position_left", build_qpos_output(result[8:16]), ts)
+        if "right" in kin.setup.sides:
+            node.send_output("position_right", build_qpos_output(result[:8]), ts)
+        if "left" in kin.setup.sides:
+            node.send_output("position_left", build_qpos_output(result[8:16]), ts)
 
 
 def main() -> None:
@@ -129,6 +219,7 @@ def main() -> None:
     )
     register_common_args(parser)
     register_ik_args(parser)
+    parser.add_argument("--measured-state-timeout", type=float, default=0.1)
     args = parser.parse_args()
     _run(args)
 
