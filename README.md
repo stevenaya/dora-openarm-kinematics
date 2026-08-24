@@ -39,13 +39,15 @@ Solves joint angles from EE pose targets using mink's QP-based differential IK. 
 
 | | |
 |---|---|
-| **Inputs** | `target_right`, `target_left` `[{"pose": float32[8]}]` — EE pose plus gripper; `state_right`, `state_left` — normalized `qpos[8]` / `qvel[8]` state; `syncstate` `bool[1]` — measured-state synchronization; optional `active` `bool[1]` — output gate |
+| **Inputs** | `target_right`, `target_left` `[{"pose": float32[8]}]` — EE pose plus gripper; `state_right`, `state_left` — normalized `qpos[8]` / `qvel[8]` state; `syncstate` `bool[1]` — reference synchronization interval; optional `sync_mode` `string[1]` — `full` (default) or `reference`; optional `active` `bool[1]` — output gate |
 | **Outputs** | `position_right`, `position_left` `[{"qpos": float32[8]}]` |
 
 `--target-mode absolute` preserves direct target handling. In `relative` mode,
 targets received during `syncstate=true` are captured as source references when
 synchronization is released, then their translation and rotation deltas are
-applied to end-effector poses computed from the same measured joint snapshot.
+applied to end-effector poses computed from the IK configuration. `full` first
+updates that configuration from fresh measured joints; `reference` preserves
+the existing configuration. Omitting `sync_mode` preserves full-sync behavior.
 The next complete active-arm target pair starts solving. If `active` is not
 connected, output is enabled for compatibility with existing dataflows. Source
 and absolute poses use the configured IK origin frame (normally `arm_origin`).
@@ -84,8 +86,12 @@ mode. When connected to an evaluation UI, existing `start`, `intervene`,
 
 | | |
 |---|---|
-| **Inputs** | `grip_left`, `grip_right` `float32[1]`; optional `command` `string[1]` |
-| **Outputs** | `active`, `syncstate` `bool[1]`; `status` `string[1]` |
+| **Inputs** | `grip_left`, `grip_right` `float32[1]`; optional `force_full_sync` `bool[1]`; optional `command` `string[1]` |
+| **Outputs** | `active`, `syncstate` `bool[1]`; `sync_mode`, `status` `string[1]` |
+
+The first synchronization after startup or `intervene` uses `full`. Later
+clutches use `reference`; pressing `force_full_sync` during a clutch upgrades
+that synchronization to `full` until the clutch is released.
 
 ```
 --sync-trigger            left | right | both  (default: left)

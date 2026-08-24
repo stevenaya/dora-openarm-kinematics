@@ -19,11 +19,13 @@ joint states, or actions.
 
 Inputs:
   grip_left/right - float[1] analog synchronization triggers
+  force_full_sync - optional bool[1] button; upgrades the active sync to full
   command - optional string[1] evaluation command (start/intervene/stop/quit)
 
 Outputs:
   active - bool[1], true while relative teleoperation may drive the arm
-  syncstate - bool[1], true while IK should synchronize measured state
+  syncstate - bool[1], true while IK should synchronize references
+  sync_mode - "full" for measured configuration + references, or "reference"
   status - inactive, waiting_trigger, syncing, or tracking
 """
 
@@ -60,6 +62,9 @@ class _TeleopState:
     status: str = "waiting_trigger"
     active: bool = False
     syncstate: bool = False
+    sync_mode: str = "full"
+    first_sync: bool = True
+    force_full_pressed: bool = False
     left: _GripState = field(default_factory=_GripState)
     right: _GripState = field(default_factory=_GripState)
 
@@ -89,6 +94,12 @@ def _extract_command(value: pa.Array) -> str:
     if len(value) != 1 or not pa.types.is_string(value.type) or not value[0].is_valid:
         raise ValueError("expected command string[1]")
     return str(value[0].as_py())
+
+
+def _extract_bool(value: pa.Array, name: str) -> bool:
+    if len(value) != 1 or not pa.types.is_boolean(value.type) or not value[0].is_valid:
+        raise ValueError(f"expected {name} bool[1]")
+    return bool(value[0].as_py())
 
 
 def _run(args: argparse.Namespace) -> None:
@@ -124,10 +135,18 @@ def _run(args: argparse.Namespace) -> None:
             state.status = value
             node.send_output("status", pa.array([value]), metadata)
 
+    def set_sync_mode(value: str, metadata: dict) -> None:
+        if value != state.sync_mode:
+            state.sync_mode = value
+            node.send_output("sync_mode", pa.array([value]), metadata)
+
     def reset(*, enabled: bool, metadata: dict) -> None:
         state.enabled = enabled
+        state.first_sync = True
+        state.force_full_pressed = False
         state.reset_grips()
         set_gates(active=False, syncstate=False, metadata=metadata, force=True)
+        set_sync_mode("full", metadata)
         set_status(
             "waiting_trigger" if enabled else "inactive",
             metadata,
@@ -139,8 +158,15 @@ def _run(args: argparse.Namespace) -> None:
             return
         if state.triggered:
             if state.status != "syncing":
+                mode = (
+                    "full"
+                    if state.first_sync or state.force_full_pressed
+                    else "reference"
+                )
+                set_sync_mode(mode, metadata)
                 set_gates(active=False, syncstate=True, metadata=metadata)
                 set_status("syncing", metadata)
+                state.first_sync = False
         elif state.status == "syncing":
             set_gates(active=True, syncstate=False, metadata=metadata)
             set_status("tracking", metadata)
@@ -164,6 +190,24 @@ def _run(args: argparse.Namespace) -> None:
                 reset(enabled=True, metadata=metadata)
             elif command == "start" or command in STOP_COMMANDS:
                 reset(enabled=False, metadata=metadata)
+            continue
+
+        if event_id == "force_full_sync":
+            try:
+                pressed = _extract_bool(event["value"], event_id)
+            except ValueError as exc:
+                print(f"Warning: {exc}. Skipping.")
+                continue
+            rising_edge = pressed and not state.force_full_pressed
+            state.force_full_pressed = pressed
+            if (
+                rising_edge
+                and state.enabled
+                and state.triggered
+                and state.status == "syncing"
+                and state.sync_mode == "reference"
+            ):
+                set_sync_mode("full", metadata)
             continue
 
         if event_id not in {"grip_left", "grip_right"}:
