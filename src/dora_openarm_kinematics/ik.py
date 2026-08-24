@@ -24,10 +24,11 @@ Inputs:
   target_left  – [{"pose": float32[8]}]  left  EE target pose + gripper angle
   state_right/left – normalized state with qpos[8] and qvel[8]; measured qpos
                      is used by state-aware limits and configuration sync
+  command_right/left – latest driver-accepted qpos[8] command
+  reset – optional bool[1] one-shot event that clears all runtime state
   syncstate – bool[1], true while reference synchronization is active
-  sync_mode – optional string[1], "full" or "reference"; defaults to "full"
-              full updates IK configuration from measured q before anchoring,
-              reference anchors from the existing IK configuration
+  sync_mode – optional string[1], "state", "command", or "reference";
+              defaults to "state"
   active – optional bool[1] output gate; absent means active
   Flat float32 arrays are also accepted for target inputs.
 
@@ -58,8 +59,8 @@ from dora_openarm_kinematics.relative_target import RelativeTargetMapper
 
 
 _QPOS_STRUCT_TYPE = pa.struct({"qpos": pa.list_(pa.float32())})
-_SYNC_MODES = {"full", "reference"}
-_DEFAULT_SYNC_MODE = "full"
+_SYNC_MODES = {"state", "command", "reference"}
+_DEFAULT_SYNC_MODE = "state"
 
 
 def build_qpos_output(qpos: np.ndarray) -> pa.Array:
@@ -118,14 +119,17 @@ def _run(args: argparse.Namespace) -> None:
     node.send_output("status", pa.array(["ready"]))
     status = "ready"
     sides = kin.setup.sides
-    state_qpos = np.concatenate(
+    initial_configuration_qpos = np.concatenate(
         [
             np.append(*kin.setup.joint_resolver.get_driver(kin.setup.data.qpos, side))
             for side in ("right", "left")
         ]
     ).astype(np.float32)
+    state_qpos = initial_configuration_qpos.copy()
+    command_qpos = initial_configuration_qpos.copy()
     configuration_qpos = state_qpos.copy()
     state_received_at: dict[str, float] = {}
+    command_received: set[str] = set()
     targets: dict[str, np.ndarray] = {}
     target_received_at: dict[str, float] = {}
     pending_targets = set(sides)
@@ -137,7 +141,7 @@ def _run(args: argparse.Namespace) -> None:
     requested_sync_mode = _DEFAULT_SYNC_MODE
     active_sync_mode: str | None = None
     sync_reference_qpos: np.ndarray | None = None
-    measured_configuration_synced = False
+    configuration_initialized = True
     calibration_valid = args.target_mode == "absolute"
 
     def set_status(value: str) -> None:
@@ -147,7 +151,7 @@ def _run(args: argparse.Namespace) -> None:
             node.send_output("status", pa.array([value]))
 
     def sync_from_cached_state(now: float, *, final: bool = False) -> bool:
-        nonlocal configuration_qpos, measured_configuration_synced
+        nonlocal configuration_qpos, configuration_initialized
         nonlocal sync_reference_qpos
         if not _has_fresh_state(
             state_received_at,
@@ -159,12 +163,80 @@ def _run(args: argparse.Namespace) -> None:
         q_snapshot = state_qpos.copy()
         kin.sync(q_snapshot)
         configuration_qpos = q_snapshot
-        measured_configuration_synced = True
-        if active_sync_mode == "full":
+        configuration_initialized = True
+        if active_sync_mode == "state":
             sync_reference_qpos = configuration_qpos.copy()
         if final:
             print("[ik] Synchronized configuration from measured state.", flush=True)
         return True
+
+    def sync_from_cached_command(*, final: bool = False) -> bool:
+        nonlocal configuration_qpos, configuration_initialized
+        nonlocal sync_reference_qpos
+        if not all(side in command_received for side in sides):
+            return False
+        q_snapshot = command_qpos.copy()
+        kin.sync(q_snapshot)
+        configuration_qpos = q_snapshot
+        configuration_initialized = True
+        if active_sync_mode == "command":
+            sync_reference_qpos = configuration_qpos.copy()
+        if final:
+            print("[ik] Synchronized configuration from executed command.", flush=True)
+        return True
+
+    def sync_from_active_source(now: float, *, final: bool = False) -> bool:
+        nonlocal active_sync_mode, sync_reference_qpos
+        if active_sync_mode == "command":
+            if sync_from_cached_command(final=final):
+                return True
+            active_sync_mode = "state"
+            print(
+                "[ik] Executed command pair unavailable; falling back to state sync.",
+                flush=True,
+            )
+        if active_sync_mode == "state":
+            return sync_from_cached_state(now, final=final)
+        if active_sync_mode == "reference":
+            if configuration_initialized:
+                sync_reference_qpos = configuration_qpos.copy()
+                return True
+            active_sync_mode = "state"
+            print(
+                "[ik] Configuration is not initialized; falling back to state sync.",
+                flush=True,
+            )
+            return sync_from_cached_state(now, final=final)
+        return False
+
+    def reset_runtime_state() -> None:
+        nonlocal state_qpos, command_qpos, configuration_qpos
+        nonlocal pending_targets, active, sync_enabled, sync_pending
+        nonlocal sync_started_at, requested_sync_mode, active_sync_mode
+        nonlocal sync_reference_qpos, configuration_initialized
+        nonlocal calibration_valid
+        active = False
+        sync_enabled = False
+        sync_pending = False
+        sync_started_at = None
+        requested_sync_mode = _DEFAULT_SYNC_MODE
+        active_sync_mode = None
+        sync_reference_qpos = None
+        configuration_initialized = False
+        calibration_valid = args.target_mode == "absolute"
+        state_qpos = initial_configuration_qpos.copy()
+        command_qpos = initial_configuration_qpos.copy()
+        configuration_qpos = initial_configuration_qpos.copy()
+        state_received_at.clear()
+        command_received.clear()
+        targets.clear()
+        target_received_at.clear()
+        pending_targets = set(sides)
+        mapper.reset()
+        kin.sync(initial_configuration_qpos)
+        kin.clear_measured_state()
+        set_status("ready")
+        print("[ik] Runtime state reset.", flush=True)
 
     def fail_relative_calibration(reasons: list[str]) -> None:
         nonlocal calibration_valid, pending_targets
@@ -195,7 +267,7 @@ def _run(args: argparse.Namespace) -> None:
                     reasons.append(
                         f"{side} source pose is {now - received_at:.3f}s old"
                     )
-        if mode == "full":
+        if mode == "state":
             for side in sides:
                 received_at = state_received_at.get(side)
                 if received_at is None:
@@ -204,6 +276,10 @@ def _run(args: argparse.Namespace) -> None:
                     reasons.append(
                         f"{side} measured state is {now - received_at:.3f}s old"
                     )
+        elif mode == "command":
+            for side in sides:
+                if side not in command_received:
+                    reasons.append(f"missing {side} executed command")
         if sync_reference_qpos is None:
             reasons.append("missing IK configuration reference")
         if reasons:
@@ -213,8 +289,14 @@ def _run(args: argparse.Namespace) -> None:
             sync_reference_qpos = None
             return False
 
-        if mode == "full" and not sync_from_cached_state(now, final=True):
+        if mode == "state" and not sync_from_cached_state(now, final=True):
             fail_relative_calibration(["measured state became stale"])
+            sync_started_at = None
+            active_sync_mode = None
+            sync_reference_qpos = None
+            return False
+        if mode == "command" and not sync_from_cached_command(final=True):
+            fail_relative_calibration(["executed command pair became unavailable"])
             sync_started_at = None
             active_sync_mode = None
             sync_reference_qpos = None
@@ -258,6 +340,7 @@ def _run(args: argparse.Namespace) -> None:
             not active
             or sync_enabled
             or sync_pending
+            or not configuration_initialized
             or not calibration_valid
             or pending_targets
         ):
@@ -333,20 +416,27 @@ def _run(args: argparse.Namespace) -> None:
         eid = event["id"]
         now = time.monotonic()
 
+        if eid == "reset":
+            try:
+                requested = extract_bool(event["value"], "reset")
+            except ValueError as exc:
+                print(f"Warning: {exc}. Skipping.")
+                continue
+            if requested:
+                reset_runtime_state()
+            continue
+
         if eid == "sync_mode":
             try:
                 mode = extract_sync_mode(event["value"])
             except ValueError as exc:
-                print(
-                    f"Warning: {exc}; defaulting sync_mode to {_DEFAULT_SYNC_MODE!r}.",
-                    flush=True,
-                )
-                mode = _DEFAULT_SYNC_MODE
+                print(f"Warning: {exc}. Skipping.", flush=True)
+                continue
             requested_sync_mode = mode
-            if sync_enabled and active_sync_mode == "reference" and mode == "full":
-                active_sync_mode = "full"
+            if sync_enabled and mode == "state" and active_sync_mode != "state":
+                active_sync_mode = "state"
                 sync_from_cached_state(now)
-                print("[ik] Promoted active synchronization to full.", flush=True)
+                print("[ik] Promoted active synchronization to state.", flush=True)
             continue
 
         if eid == "active":
@@ -367,8 +457,8 @@ def _run(args: argparse.Namespace) -> None:
                 print(f"Warning: {exc}. Skipping.")
                 continue
             if requested == sync_enabled:
-                if requested and active_sync_mode == "full":
-                    sync_from_cached_state(now)
+                if requested:
+                    sync_from_active_source(now)
                 continue
 
             sync_enabled = requested
@@ -378,23 +468,12 @@ def _run(args: argparse.Namespace) -> None:
                 sync_started_at = now
                 active_sync_mode = requested_sync_mode
                 if args.target_mode == "absolute":
-                    active_sync_mode = "full"
-                elif (
-                    active_sync_mode == "reference"
-                    and not measured_configuration_synced
-                ):
-                    active_sync_mode = "full"
-                    print(
-                        "[ik] No measured configuration is available; "
-                        "promoting synchronization to full.",
-                        flush=True,
-                    )
+                    active_sync_mode = "state"
                 sync_reference_qpos = configuration_qpos.copy()
                 if args.target_mode == "relative":
                     calibration_valid = False
                     mapper.reset()
-                if active_sync_mode == "full":
-                    sync_from_cached_state(now)
+                sync_from_active_source(now)
             elif args.target_mode == "relative":
                 sync_pending = False
                 calibrate_relative(now)
@@ -419,10 +498,25 @@ def _run(args: argparse.Namespace) -> None:
             arm_slice = slice(0, 8) if side == "right" else slice(8, 16)
             state_qpos[arm_slice] = qpos
             state_received_at[side] = now
-            if sync_enabled and active_sync_mode == "full":
+            if sync_enabled and active_sync_mode == "state":
                 sync_from_cached_state(now)
             elif sync_pending:
                 finish_absolute_sync(now)
+            continue
+
+        if eid in {"command_right", "command_left"}:
+            side = eid.removeprefix("command_")
+            if side not in sides:
+                continue
+            qpos = extract_values(event["value"], "qpos")
+            if qpos.shape != (8,) or not np.all(np.isfinite(qpos)):
+                print(f"Warning: expected finite {eid} qpos[8]. Skipping.")
+                continue
+            arm_slice = slice(0, 8) if side == "right" else slice(8, 16)
+            command_qpos[arm_slice] = qpos
+            command_received.add(side)
+            if sync_enabled and active_sync_mode == "command":
+                sync_from_cached_command()
             continue
 
         if eid in {"target_right", "target_left"}:

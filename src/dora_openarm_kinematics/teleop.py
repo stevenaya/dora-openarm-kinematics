@@ -19,13 +19,14 @@ joint states, or actions.
 
 Inputs:
   grip_left/right - float[1] analog synchronization triggers
-  force_full_sync - optional bool[1] button; upgrades the active sync to full
+  force_state_sync - optional bool[1] button; upgrades the active sync to state
   command - optional string[1] evaluation command (start/intervene/stop/quit)
 
 Outputs:
   active - bool[1], true while relative teleoperation may drive the arm
   syncstate - bool[1], true while IK should synchronize references
-  sync_mode - "full" for measured configuration + references, or "reference"
+  sync_mode - "command", "state", or "reference"
+  reset - bool[1] one-shot event that clears IK runtime state
   status - inactive, waiting_trigger, syncing, or tracking
 """
 
@@ -62,9 +63,9 @@ class _TeleopState:
     status: str = "waiting_trigger"
     active: bool = False
     syncstate: bool = False
-    sync_mode: str = "full"
+    sync_mode: str = "state"
     first_sync: bool = True
-    force_full_pressed: bool = False
+    force_state_pressed: bool = False
     left: _GripState = field(default_factory=_GripState)
     right: _GripState = field(default_factory=_GripState)
 
@@ -140,29 +141,30 @@ def _run(args: argparse.Namespace) -> None:
             state.sync_mode = value
             node.send_output("sync_mode", pa.array([value]), metadata)
 
-    def reset(*, enabled: bool, metadata: dict) -> None:
+    def reset(*, enabled: bool, metadata: dict, reset_ik: bool = False) -> None:
         state.enabled = enabled
         state.first_sync = True
-        state.force_full_pressed = False
+        state.force_state_pressed = False
         state.reset_grips()
         set_gates(active=False, syncstate=False, metadata=metadata, force=True)
-        set_sync_mode("full", metadata)
+        set_sync_mode("state", metadata)
         set_status(
             "waiting_trigger" if enabled else "inactive",
             metadata,
             force=True,
         )
+        if reset_ik:
+            send_bool("reset", True, metadata)
 
     def update_trigger(metadata: dict) -> None:
         if not state.enabled:
             return
         if state.triggered:
             if state.status != "syncing":
-                mode = (
-                    "full"
-                    if state.first_sync or state.force_full_pressed
-                    else "reference"
-                )
+                if state.force_state_pressed:
+                    mode = "state"
+                else:
+                    mode = "command" if state.first_sync else "reference"
                 set_sync_mode(mode, metadata)
                 set_gates(active=False, syncstate=True, metadata=metadata)
                 set_status("syncing", metadata)
@@ -189,25 +191,25 @@ def _run(args: argparse.Namespace) -> None:
             if command == "intervene":
                 reset(enabled=True, metadata=metadata)
             elif command == "start" or command in STOP_COMMANDS:
-                reset(enabled=False, metadata=metadata)
+                reset(enabled=False, metadata=metadata, reset_ik=True)
             continue
 
-        if event_id == "force_full_sync":
+        if event_id == "force_state_sync":
             try:
                 pressed = _extract_bool(event["value"], event_id)
             except ValueError as exc:
                 print(f"Warning: {exc}. Skipping.")
                 continue
-            rising_edge = pressed and not state.force_full_pressed
-            state.force_full_pressed = pressed
+            rising_edge = pressed and not state.force_state_pressed
+            state.force_state_pressed = pressed
             if (
                 rising_edge
                 and state.enabled
                 and state.triggered
                 and state.status == "syncing"
-                and state.sync_mode == "reference"
+                and state.sync_mode != "state"
             ):
-                set_sync_mode("full", metadata)
+                set_sync_mode("state", metadata)
             continue
 
         if event_id not in {"grip_left", "grip_right"}:
