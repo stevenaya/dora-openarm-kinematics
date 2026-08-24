@@ -45,6 +45,7 @@ Repository = "https://github.com/enactic/dora-openarm-kinematics"
 [project.scripts]
 dora-openarm-fk = "dora_openarm_kinematics.fk:main"
 dora-openarm-ik = "dora_openarm_kinematics.ik:main"
+dora-openarm-teleop = "dora_openarm_kinematics.teleop:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

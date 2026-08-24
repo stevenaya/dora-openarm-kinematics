@@ -73,6 +73,26 @@ complete state machine, coordinate convention, and integration sequence.
 --xml            MJCF scene file
 ```
 
+---
+
+### `dora-openarm-teleop` — Relative Teleoperation State
+
+Owns the synchronization trigger state without forwarding pose, joint, or
+action data. With no `command` input it starts in standalone teleoperation
+mode. When connected to an evaluation UI, existing `start`, `intervene`,
+`stop`, and `quit` commands disable, arm, or reset teleoperation.
+
+| | |
+|---|---|
+| **Inputs** | `grip_left`, `grip_right` `float32[1]`; optional `command` `string[1]` |
+| **Outputs** | `active`, `syncstate` `bool[1]`; `status` `string[1]` |
+
+```
+--sync-trigger            left | right | both  (default: left)
+--grip-engage-threshold   press threshold  (default: 0.7)
+--grip-release-threshold  release threshold  (default: 0.5)
+```
+
 ## Quick Start
 
 ### FK — visualise leader arm poses
