@@ -41,6 +41,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import numbers
 import time
 
 import dora
@@ -61,6 +62,7 @@ from dora_openarm_kinematics.relative_target import RelativeTargetMapper
 _QPOS_STRUCT_TYPE = pa.struct({"qpos": pa.list_(pa.float32())})
 _SYNC_MODES = {"state", "command", "reference"}
 _DEFAULT_SYNC_MODE = "state"
+_COMMAND_STATE_MAX_DELTA = 0.2
 
 
 def build_qpos_output(qpos: np.ndarray) -> pa.Array:
@@ -101,6 +103,20 @@ def _has_fresh_state(
     return all(now - received_at.get(side, -np.inf) <= timeout for side in sides)
 
 
+def _metadata_start_epoch(metadata: dict) -> tuple[bool, int | None]:
+    """Return whether an optional start_epoch is well formed and its value."""
+    if "start_epoch" not in metadata:
+        return True, None
+    value = metadata["start_epoch"]
+    if (
+        not isinstance(value, numbers.Integral)
+        or isinstance(value, bool)
+        or int(value) < 0
+    ):
+        return False, None
+    return True, int(value)
+
+
 def _run(args: argparse.Namespace) -> None:
     if (
         not np.isfinite(args.measured_state_timeout)
@@ -129,7 +145,7 @@ def _run(args: argparse.Namespace) -> None:
     command_qpos = initial_configuration_qpos.copy()
     configuration_qpos = state_qpos.copy()
     state_received_at: dict[str, float] = {}
-    command_received: set[str] = set()
+    command_received_at: dict[str, float] = {}
     targets: dict[str, np.ndarray] = {}
     target_received_at: dict[str, float] = {}
     pending_targets = set(sides)
@@ -143,6 +159,7 @@ def _run(args: argparse.Namespace) -> None:
     sync_reference_qpos: np.ndarray | None = None
     configuration_initialized = True
     calibration_valid = args.target_mode == "absolute"
+    cached_start_epoch: int | None = None
 
     def set_status(value: str) -> None:
         nonlocal status
@@ -170,10 +187,34 @@ def _run(args: argparse.Namespace) -> None:
             print("[ik] Synchronized configuration from measured state.", flush=True)
         return True
 
-    def sync_from_cached_command(*, final: bool = False) -> bool:
+    def command_seed_rejection_reasons(now: float) -> list[str]:
+        reasons = []
+        for source, received_at in (
+            ("executed command", command_received_at),
+            ("measured state", state_received_at),
+        ):
+            for side in sides:
+                timestamp = received_at.get(side)
+                if timestamp is None:
+                    reasons.append(f"missing {side} {source}")
+                elif now - timestamp > args.measured_state_timeout:
+                    reasons.append(f"{side} {source} is {now - timestamp:.3f}s old")
+        if reasons:
+            return reasons
+        for side in sides:
+            arm_slice = slice(0, 8) if side == "right" else slice(8, 16)
+            delta = np.abs(command_qpos[arm_slice][:7] - state_qpos[arm_slice][:7])
+            if np.any(delta > _COMMAND_STATE_MAX_DELTA):
+                reasons.append(
+                    f"{side} command/state delta {float(np.max(delta)):.3f}rad "
+                    f"exceeds {_COMMAND_STATE_MAX_DELTA:.3f}rad"
+                )
+        return reasons
+
+    def sync_from_cached_command(now: float, *, final: bool = False) -> bool:
         nonlocal configuration_qpos, configuration_initialized
         nonlocal sync_reference_qpos
-        if not all(side in command_received for side in sides):
+        if command_seed_rejection_reasons(now):
             return False
         q_snapshot = command_qpos.copy()
         kin.sync(q_snapshot)
@@ -188,11 +229,13 @@ def _run(args: argparse.Namespace) -> None:
     def sync_from_active_source(now: float, *, final: bool = False) -> bool:
         nonlocal active_sync_mode, sync_reference_qpos
         if active_sync_mode == "command":
-            if sync_from_cached_command(final=final):
+            rejection_reasons = command_seed_rejection_reasons(now)
+            if not rejection_reasons and sync_from_cached_command(now, final=final):
                 return True
             active_sync_mode = "state"
             print(
-                "[ik] Executed command pair unavailable; falling back to state sync.",
+                "[ik] Executed command seed rejected; falling back to state sync: "
+                + "; ".join(rejection_reasons),
                 flush=True,
             )
         if active_sync_mode == "state":
@@ -214,7 +257,7 @@ def _run(args: argparse.Namespace) -> None:
         nonlocal pending_targets, active, sync_enabled, sync_pending
         nonlocal sync_started_at, requested_sync_mode, active_sync_mode
         nonlocal sync_reference_qpos, configuration_initialized
-        nonlocal calibration_valid
+        nonlocal calibration_valid, cached_start_epoch
         active = False
         sync_enabled = False
         sync_pending = False
@@ -228,31 +271,99 @@ def _run(args: argparse.Namespace) -> None:
         command_qpos = initial_configuration_qpos.copy()
         configuration_qpos = initial_configuration_qpos.copy()
         state_received_at.clear()
-        command_received.clear()
+        command_received_at.clear()
         targets.clear()
         target_received_at.clear()
         pending_targets = set(sides)
         mapper.reset()
         kin.sync(initial_configuration_qpos)
         kin.clear_measured_state()
+        cached_start_epoch = None
         set_status("ready")
         print("[ik] Runtime state reset.", flush=True)
 
     def fail_relative_calibration(reasons: list[str]) -> None:
-        nonlocal calibration_valid, pending_targets
+        nonlocal calibration_valid, pending_targets, sync_enabled, sync_pending
+        nonlocal sync_started_at, active_sync_mode, sync_reference_qpos
+        nonlocal configuration_initialized
         calibration_valid = False
+        sync_enabled = False
+        sync_pending = False
+        sync_started_at = None
+        active_sync_mode = None
+        sync_reference_qpos = None
+        configuration_initialized = False
+        state_received_at.clear()
+        command_received_at.clear()
+        targets.clear()
+        target_received_at.clear()
         pending_targets = set(sides)
         mapper.reset()
+        kin.clear_measured_state()
         print(
             "[ik] Relative calibration failed: " + "; ".join(reasons),
             flush=True,
         )
         set_status("relative_recalibration_required")
 
+    def invalidate_input_generation(reason: str) -> None:
+        """Discard samples that may belong to a different arm start."""
+        nonlocal pending_targets
+        if args.target_mode == "relative":
+            fail_relative_calibration([reason])
+            return
+        state_received_at.clear()
+        command_received_at.clear()
+        targets.clear()
+        target_received_at.clear()
+        pending_targets = set(sides)
+        kin.clear_measured_state()
+
+    def accept_input_epoch(metadata: dict, event_id: str) -> bool:
+        """Apply the shared epoch protocol to state and command inputs."""
+        nonlocal cached_start_epoch
+        valid, incoming_epoch = _metadata_start_epoch(metadata)
+        if not valid:
+            invalidate_input_generation(f"malformed start_epoch on {event_id}")
+            return False
+        if cached_start_epoch is None:
+            if incoming_epoch is not None:
+                cached_start_epoch = incoming_epoch
+            return True
+        if incoming_epoch is None:
+            invalidate_input_generation(f"missing start_epoch on {event_id}")
+            return False
+        if incoming_epoch == cached_start_epoch:
+            return True
+        if incoming_epoch < cached_start_epoch:
+            print(
+                f"[ik] Dropping stale {event_id} start_epoch={incoming_epoch}; "
+                f"current={cached_start_epoch}.",
+                flush=True,
+            )
+            return False
+        previous_epoch = cached_start_epoch
+        cached_start_epoch = incoming_epoch
+        invalidate_input_generation(
+            f"start_epoch advanced from {previous_epoch} to {incoming_epoch} "
+            f"on {event_id}"
+        )
+        return True
+
     def calibrate_relative(now: float) -> bool:
         nonlocal calibration_valid, pending_targets, sync_started_at
         nonlocal active_sync_mode, sync_reference_qpos
         mode = active_sync_mode or _DEFAULT_SYNC_MODE
+        if mode == "command":
+            rejection_reasons = command_seed_rejection_reasons(now)
+            if rejection_reasons:
+                mode = "state"
+                active_sync_mode = "state"
+                print(
+                    "[ik] Executed command seed rejected at sync release; "
+                    "falling back to state sync: " + "; ".join(rejection_reasons),
+                    flush=True,
+                )
         reasons: list[str] = []
         if sync_started_at is None:
             reasons.append("no preceding sync interval")
@@ -277,9 +388,7 @@ def _run(args: argparse.Namespace) -> None:
                         f"{side} measured state is {now - received_at:.3f}s old"
                     )
         elif mode == "command":
-            for side in sides:
-                if side not in command_received:
-                    reasons.append(f"missing {side} executed command")
+            reasons.extend(command_seed_rejection_reasons(now))
         if sync_reference_qpos is None:
             reasons.append("missing IK configuration reference")
         if reasons:
@@ -295,7 +404,7 @@ def _run(args: argparse.Namespace) -> None:
             active_sync_mode = None
             sync_reference_qpos = None
             return False
-        if mode == "command" and not sync_from_cached_command(final=True):
+        if mode == "command" and not sync_from_cached_command(now, final=True):
             fail_relative_calibration(["executed command pair became unavailable"])
             sync_started_at = None
             active_sync_mode = None
@@ -385,6 +494,8 @@ def _run(args: argparse.Namespace) -> None:
         configuration_qpos = result.copy()
 
         ts = {"timestamp": time.time_ns()}
+        if cached_start_epoch is not None:
+            ts["start_epoch"] = cached_start_epoch
         if "right" in sides:
             node.send_output("position_right", build_qpos_output(result[:8]), ts)
         if "left" in sides:
@@ -483,14 +594,21 @@ def _run(args: argparse.Namespace) -> None:
             continue
 
         if eid in {"state_right", "state_left"}:
+            if not accept_input_epoch(event["metadata"], eid):
+                continue
             if not pa.types.is_struct(event["value"].type):
                 print(f"Warning: expected normalized struct for {eid}. Skipping.")
                 continue
             qpos = extract_values(event["value"], "qpos")
             qvel = extract_values(event["value"], "qvel")
-            if qpos.shape != (8,) or qvel.shape != (8,):
+            if (
+                qpos.shape != (8,)
+                or qvel.shape != (8,)
+                or not np.all(np.isfinite(qpos))
+                or not np.all(np.isfinite(qvel))
+            ):
                 print(
-                    f"Warning: expected {eid} qpos[8]/qvel[8], "
+                    f"Warning: expected finite {eid} qpos[8]/qvel[8], "
                     f"got {qpos.shape}/{qvel.shape}. Skipping."
                 )
                 continue
@@ -505,6 +623,8 @@ def _run(args: argparse.Namespace) -> None:
             continue
 
         if eid in {"command_right", "command_left"}:
+            if not accept_input_epoch(event["metadata"], eid):
+                continue
             side = eid.removeprefix("command_")
             if side not in sides:
                 continue
@@ -514,9 +634,9 @@ def _run(args: argparse.Namespace) -> None:
                 continue
             arm_slice = slice(0, 8) if side == "right" else slice(8, 16)
             command_qpos[arm_slice] = qpos
-            command_received.add(side)
+            command_received_at[side] = now
             if sync_enabled and active_sync_mode == "command":
-                sync_from_cached_command()
+                sync_from_cached_command(now)
             continue
 
         if eid in {"target_right", "target_left"}:

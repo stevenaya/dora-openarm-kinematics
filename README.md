@@ -48,8 +48,12 @@ synchronization is released, then their translation and rotation deltas are
 applied to end-effector poses computed from the IK configuration. `state`
 initializes that configuration from fresh measured joints, `command` uses the
 latest complete driver-accepted command pair, and `reference` preserves the
-existing configuration. A missing command pair falls back atomically to
-`state`. Omitting `sync_mode` selects `state`.
+existing configuration. A command pair must be fresh and within `0.2 rad` of
+the fresh measured state on every arm joint except the gripper; otherwise it
+falls back atomically to `state`. Omitting `sync_mode` selects `state`.
+Once a `start_epoch` is observed on state or command metadata, all four inputs
+must carry the same epoch. A newer epoch invalidates relative calibration and
+requires another synchronization cycle.
 The next complete active-arm target pair starts solving. If `active` is not
 connected, output is enabled for compatibility with existing dataflows. Source
 and absolute poses use the configured IK origin frame (normally `arm_origin`).
@@ -82,20 +86,21 @@ complete state machine, coordinate convention, and integration sequence.
 ### `dora-openarm-teleop` — Relative Teleoperation State
 
 Owns the synchronization trigger state without forwarding pose, joint, or
-action data. With no `command` input it starts in standalone teleoperation
-mode. When connected to an evaluation UI, existing `start`, `intervene`,
-`stop`, and `quit` commands disable, arm, or reset teleoperation.
+action data. With no `enable` input it starts enabled for standalone data
+collection. An evaluation UI may connect the optional boolean `enable` input;
+the first value and each later edge reset IK state. Repeated equal values have
+no effect.
 
 | | |
 |---|---|
-| **Inputs** | `grip_left`, `grip_right` `float32[1]`; optional `force_state_sync` `bool[1]`; optional `command` `string[1]` |
+| **Inputs** | `grip_left`, `grip_right` `float32[1]`; optional `force_state_sync`, `enable` `bool[1]`; optional `ik_status` `string[1]` |
 | **Outputs** | `active`, `syncstate`, `reset` `bool[1]`; `sync_mode`, `status` `string[1]` |
 
-The first synchronization after `intervene` uses `command`. Later clutches use
-`reference`; pressing `force_state_sync` during a clutch upgrades that
-synchronization to `state` until the clutch is released. Episode start and
-terminal commands emit a one-shot `reset` event; `intervene` preserves the
-latest command cache.
+The first synchronization after enable or recalibration uses `command`. Later
+clutches use `reference`; pressing `force_state_sync` during a clutch upgrades
+that synchronization to `state` until the clutch is released. Receiving
+`relative_recalibration_required` on `ik_status` closes both gates and reports
+`require_sync` until the trigger is released and pressed again.
 
 ```
 --sync-trigger            left | right | both  (default: left)

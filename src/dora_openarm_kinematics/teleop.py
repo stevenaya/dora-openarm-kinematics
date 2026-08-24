@@ -20,14 +20,15 @@ joint states, or actions.
 Inputs:
   grip_left/right - float[1] analog synchronization triggers
   force_state_sync - optional bool[1] button; upgrades the active sync to state
-  command - optional string[1] evaluation command (start/intervene/stop/quit)
+  enable - optional bool[1]; absent means teleoperation is enabled
+  ik_status - optional IK status used to request a new synchronization
 
 Outputs:
   active - bool[1], true while relative teleoperation may drive the arm
   syncstate - bool[1], true while IK should synchronize references
   sync_mode - "command", "state", or "reference"
   reset - bool[1] one-shot event that clears IK runtime state
-  status - inactive, waiting_trigger, syncing, or tracking
+  status - inactive, require_sync, syncing, or tracking
 """
 
 from __future__ import annotations
@@ -40,8 +41,8 @@ import dora
 import pyarrow as pa
 
 
-STOP_COMMANDS = {"stop", "cancel", "success", "fail", "quit"}
-STATUSES = {"inactive", "waiting_trigger", "syncing", "tracking"}
+STATUSES = {"inactive", "require_sync", "syncing", "tracking"}
+RECALIBRATION_REQUIRED = "relative_recalibration_required"
 
 
 @dataclass
@@ -60,12 +61,14 @@ class _GripState:
 class _TeleopState:
     sync_trigger: str
     enabled: bool = True
-    status: str = "waiting_trigger"
+    enable_received: bool = False
+    status: str = "require_sync"
     active: bool = False
     syncstate: bool = False
     sync_mode: str = "state"
     first_sync: bool = True
     force_state_pressed: bool = False
+    wait_for_trigger_release: bool = True
     left: _GripState = field(default_factory=_GripState)
     right: _GripState = field(default_factory=_GripState)
 
@@ -91,9 +94,9 @@ def _extract_grip(value: pa.Array, name: str) -> float:
     return result
 
 
-def _extract_command(value: pa.Array) -> str:
+def _extract_string(value: pa.Array, name: str) -> str:
     if len(value) != 1 or not pa.types.is_string(value.type) or not value[0].is_valid:
-        raise ValueError("expected command string[1]")
+        raise ValueError(f"expected {name} string[1]")
     return str(value[0].as_py())
 
 
@@ -145,11 +148,12 @@ def _run(args: argparse.Namespace) -> None:
         state.enabled = enabled
         state.first_sync = True
         state.force_state_pressed = False
+        state.wait_for_trigger_release = True
         state.reset_grips()
         set_gates(active=False, syncstate=False, metadata=metadata, force=True)
         set_sync_mode("state", metadata)
         set_status(
-            "waiting_trigger" if enabled else "inactive",
+            "require_sync" if enabled else "inactive",
             metadata,
             force=True,
         )
@@ -158,6 +162,11 @@ def _run(args: argparse.Namespace) -> None:
 
     def update_trigger(metadata: dict) -> None:
         if not state.enabled:
+            return
+        if state.wait_for_trigger_release:
+            if state.triggered:
+                return
+            state.wait_for_trigger_release = False
             return
         if state.triggered:
             if state.status != "syncing":
@@ -182,16 +191,37 @@ def _run(args: argparse.Namespace) -> None:
         event_id = event["id"]
         metadata = event["metadata"]
 
-        if event_id == "command":
+        if event_id == "enable":
             try:
-                command = _extract_command(event["value"])
+                enabled = _extract_bool(event["value"], event_id)
             except ValueError as exc:
                 print(f"Warning: {exc}. Skipping.")
                 continue
-            if command == "intervene":
-                reset(enabled=True, metadata=metadata)
-            elif command == "start" or command in STOP_COMMANDS:
-                reset(enabled=False, metadata=metadata, reset_ik=True)
+            changed = not state.enable_received or enabled != state.enabled
+            state.enable_received = True
+            if changed:
+                reset(enabled=enabled, metadata=metadata, reset_ik=True)
+            continue
+
+        if event_id == "ik_status":
+            try:
+                ik_status = _extract_string(event["value"], event_id)
+            except ValueError as exc:
+                print(f"Warning: {exc}. Skipping.")
+                continue
+            if ik_status == RECALIBRATION_REQUIRED and state.enabled:
+                state.first_sync = True
+                state.force_state_pressed = False
+                state.wait_for_trigger_release = True
+                state.reset_grips()
+                set_gates(
+                    active=False,
+                    syncstate=False,
+                    metadata=metadata,
+                    force=True,
+                )
+                set_sync_mode("state", metadata)
+                set_status("require_sync", metadata, force=True)
             continue
 
         if event_id == "force_state_sync":
