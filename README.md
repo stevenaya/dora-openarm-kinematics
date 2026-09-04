@@ -57,8 +57,9 @@ requires another synchronization cycle.
 The next complete active-arm target pair starts solving. If `active` is not
 connected, output is enabled for compatibility with existing dataflows. Source
 and absolute poses use the configured IK origin frame (normally `arm_origin`).
-See [IK target modes runtime proposal](docs/ik-target-modes-proposal.md) for the
-complete state machine, coordinate convention, and integration sequence.
+See [Relative teleoperation and intervention architecture](docs/relative-teleoperation-architecture.md)
+for the current node graph, signal flow, state transitions, coordinate
+convention, and recovery paths.
 
 ```
 --mode           right | left | bimanual  (default: bimanual)
@@ -101,6 +102,9 @@ clutches use `reference`; pressing `force_state_sync` during a clutch upgrades
 that synchronization to `state` until the clutch is released. Receiving
 `relative_recalibration_required` on `ik_status` closes both gates and reports
 `require_sync` until the trigger is released and pressed again.
+
+The complete evaluation intervention wiring and lifecycle are documented in
+[Relative teleoperation and intervention architecture](docs/relative-teleoperation-architecture.md).
 
 ```
 --sync-trigger            left | right | both  (default: left)
