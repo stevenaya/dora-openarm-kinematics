@@ -51,7 +51,10 @@ nodes:
   - id: ik   # ── differential IK: EE poses → joint angles ────────────────────
     build: pip install -e ..
     path: dora-openarm-ik
-    args: "--mode bimanual --max-iters 5 --dt 0.1 --damping 0.25 --posture-cost 0.01 --lm-damping 0.01"
+    args: >-
+      --mode bimanual --tick-hz 250
+      --max-iters 5 --damping 0.1
+      --posture-cost 0 --lm-damping 0.01 --limit-velocity
     inputs:
       target_right: fk/pose_right
       target_left:  fk/pose_left
