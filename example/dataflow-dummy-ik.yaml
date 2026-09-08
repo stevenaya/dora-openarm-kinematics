@@ -50,7 +50,8 @@ nodes:
   - id: ik   # ── differential IK: EE poses → joint angles ────────────────────
     build: pip install -e ..
     path: dora-openarm-ik
-    args: "--limit-velocity"
+    # Match the upstream 4 ms timer; solver tuning uses control defaults.
+    args: "--tick-hz 250 --limit-velocity"
     inputs:
       target_right: fk/pose_right
       target_left:  fk/pose_left
